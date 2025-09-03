@@ -70,7 +70,7 @@ python scripts/main.py
 │   ├── data_utils.py   # 数据处理的公用函数
 │   └── plot_utils.py   # 统一绘图风格的函数
 │
-├── lib/                # 存放从外部（如Github）复用的、非pip安装的第三方算法
+├── third_party/                # 存放从外部（如Github）复用的、非pip安装的第三方算法
 │   └── particle_swarm.py
 │
 ├── results/            # 存放所有代码生成的最终结果，用于上传到Overleaf
