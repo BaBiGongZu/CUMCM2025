@@ -127,24 +127,23 @@ class MissileInterferenceGurobi:
         blocked_count = self.check_target_blocking(missile_pos, smoke_center)
         return blocked_count >= threshold
         
-    def solve_gurobi_model(self, missile_speed=300.0, time_horizon=100, num_segments=1000):
+    def solve_gurobi_model(self, missile_speed=300.0, time_horizon=100, num_segments=100):
         """
-        使用Gurobi求解导弹干扰优化问题 (集成精确遮挡检测)
+        使用Gurobi求解导弹干扰优化问题 (简化和数值稳定版)
         
         Args:
             missile_speed: 导弹飞行速度 (m/s)
             time_horizon: 时间范围 (s)
             num_segments: 时间分段数
         """
-        print(f"\n使用Gurobi求解优化模型 (集成精确遮挡检测)...")
+        print(f"\n使用Gurobi求解优化模型 (简化和数值稳定版)...")
         missile_flight_time = self.missile_distance / missile_speed
         print(f"导弹速度: {missile_speed} m/s, 飞行时间: {missile_flight_time:.2f} s")
         
-        model = gp.Model("missile_interference_precise")
-        model.setParam('OutputFlag', 1)
-        model.setParam('MIPGap', 0.05)
-        model.setParam('TimeLimit', 300)
-        model.setParam('NonConvex', 2) # 允许求解非凸二次约束/表达式
+        model = gp.Model("missile_interference_stable")
+        model.setParam('NonConvex', 2)
+        model.setParam('TimeLimit', 3600) # 设置求解时间限制
+        model.setParam('MIPGap', 0.1)   # 设置可接受的差距
 
         dt = time_horizon / num_segments
         T = list(range(num_segments + 1))
@@ -152,25 +151,28 @@ class MissileInterferenceGurobi:
         # --- 1. 决策变量 ---
         dx = model.addVar(lb=-1, ub=1, name="dx")
         dy = model.addVar(lb=-1, ub=1, name="dy")
-        dz = model.addVar(lb=0, ub=0, name="dz") # 水平飞行
         v_uav = model.addVar(lb=self.uav_speed_min, ub=self.uav_speed_max, name="v_uav")
-        t_drop = model.addVar(lb=1, ub=time_horizon-5, name="t_drop")
-        t_explode = model.addVar(lb=2, ub=time_horizon, name="t_explode")
+        t_drop = model.addVar(lb=0, ub=time_horizon, name="t_drop")
+        t_explode = model.addVar(lb=0, ub=time_horizon, name="t_explode")
         
+        # 辅助变量，用于线性化 v_uav * t_explode
+        uav_dist = model.addVar(lb=0, ub=self.uav_speed_max * time_horizon, name="uav_dist")
+
         # --- 2. 基础约束 ---
         model.addConstr(dx*dx + dy*dy == 1, "unit_direction")
-        model.addConstr(t_explode >= t_drop + 1, "explode_after_drop")
+        model.addConstr(t_explode >= t_drop, "explode_after_drop")
+        # 使用二次约束定义 uav_dist = v_uav * t_explode
+        model.addQConstr(uav_dist == v_uav * t_explode, "uav_dist_constr")
 
         # --- 3. 派生变量 (用Gurobi表达式定义轨迹) ---
         fall_time = t_explode - t_drop
         
-        # 起爆位置 (这些是表达式，不是具体数值)
-        explode_pos_x = self.uav_pos[0] + v_uav * t_drop * dx + v_uav * fall_time * dx
-        explode_pos_y = self.uav_pos[1] + v_uav * t_drop * dy + v_uav * fall_time * dy
-        explode_pos_z = model.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name="explode_pos_z")
-        model.addConstr(explode_pos_z == self.uav_pos[2] - 0.5 * self.gravity * fall_time * fall_time, "explode_z_calc")
+        # 起爆位置表达式 (使用辅助变量 uav_dist，避免三变量乘积)
+        explode_pos_x = self.uav_pos[0] + uav_dist * dx
+        explode_pos_y = self.uav_pos[1] + uav_dist * dy
+        explode_pos_z = self.uav_pos[2] - 0.5 * self.gravity * fall_time * fall_time
 
-        # --- 4. 精确遮挡约束 (循环内) ---
+        # --- 4. 遮挡约束 (循环内) ---
         blocked = model.addVars(T, vtype=GRB.BINARY, name="blocked")
         
         for i in T:
@@ -178,77 +180,80 @@ class MissileInterferenceGurobi:
             
             # a. 定义烟雾激活状态
             is_active = model.addVar(vtype=GRB.BINARY, name=f"is_active_{i}")
-            M_time = time_horizon * 2
-            model.addConstr(time_val >= t_explode - M_time * (1 - is_active), f"active_start_{i}")
-            model.addConstr(time_val <= t_explode + self.effective_duration + M_time * (1 - is_active), f"active_end_{i}")
+            in_window_start = model.addVar(vtype=GRB.BINARY, name=f"in_window_start_{i}")
+            in_window_end = model.addVar(vtype=GRB.BINARY, name=f"in_window_end_{i}")
             
-            # b. 计算该时刻的导弹和烟雾位置
+            model.addGenConstrIndicator(in_window_start, True, time_val >= t_explode)
+            model.addGenConstrIndicator(in_window_end, True, time_val <= t_explode + self.effective_duration)
+            model.addGenConstrAnd(is_active, [in_window_start, in_window_end], f"is_active_def_{i}")
+
+            # b. 计算该时刻的导弹和烟雾位置 (作为表达式)
             missile_pos_t = self.missile_pos + missile_speed * time_val * self.missile_direction
-            
             cloud_pos_x_t = explode_pos_x
             cloud_pos_y_t = explode_pos_y
-            cloud_pos_z_t = model.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name=f"cloud_z_{i}")
-            model.addConstr(cloud_pos_z_t == explode_pos_z - self.cloud_sink_speed * (time_val - t_explode), f"cloud_z_calc_{i}")
+            cloud_pos_z_t = explode_pos_z - self.cloud_sink_speed * (time_val - t_explode)
             
-            # c. 对每个关键点，检查是否被遮挡
+            # c. 对每个关键点，检查是否被遮挡 (使用点到直线距离)
             is_blocked_by_kp = model.addVars(self.target_key_points.shape[0], vtype=GRB.BINARY, name=f"is_blocked_by_kp_{i}")
             
             for k, key_point in enumerate(self.target_key_points):
-                # 使用Gurobi的通用约束来计算点到线段的距离的平方
-                p = [cloud_pos_x_t, cloud_pos_y_t, cloud_pos_z_t]
-                a = missile_pos_t
-                b = key_point
-                
-                line_vec = b - a
-                point_vec_x = p[0] - a[0]
-                point_vec_y = p[1] - a[1]
-                point_vec_z = p[2] - a[2]
-                
+                # 定义视线向量 (从导弹到关键点)
+                line_start = missile_pos_t
+                line_end = key_point
+                line_vec = line_end - line_start
                 line_len_sq = np.dot(line_vec, line_vec)
-                if line_len_sq < 1e-9: continue # 跳过无效线段
                 
-                t_proj_num = point_vec_x * line_vec[0] + point_vec_y * line_vec[1] + point_vec_z * line_vec[2]
-                t_proj = model.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name=f"t_proj_{i}_{k}")
-                # 修正: 明确写成 y = f(x) 的形式
-                model.addConstr(t_proj == t_proj_num / line_len_sq, f"t_proj_calc_{i}_{k}")
+                if line_len_sq < 1e-9: 
+                    model.addConstr(is_blocked_by_kp[k] == 0) # 无法形成视线，认为不遮挡
+                    continue
+
+                # 定义烟雾球心到视线起点的向量
+                point_vec_x = cloud_pos_x_t - line_start[0]
+                point_vec_y = cloud_pos_y_t - line_start[1]
+                point_vec_z = cloud_pos_z_t - line_start[2]
+
+                # 计算点到直线距离的平方 (向量叉乘的模平方)
+                # cross_prod_sq = (
+                #     (point_vec_y * line_vec[2] - point_vec_z * line_vec[1])**2 +
+                #     (point_vec_z * line_vec[0] - point_vec_x * line_vec[2])**2 +
+                #     (point_vec_x * line_vec[1] - point_vec_y * line_vec[0])**2
+                # )
                 
-                # 修正: 使用两个独立的通用约束来模拟 max(0, min(1, t))
-                t_clamped = model.addVar(lb=0.0, ub=1.0, name=f"t_clamped_{i}_{k}")
-                t_min_one = model.addVar(lb=-GRB.INFINITY, ub=1.0, name=f"t_min_one_{i}_{k}")
-                model.addGenConstrMin(t_min_one, [t_proj], 1.0, name=f"g_min_{i}_{k}")
-                model.addGenConstrMax(t_clamped, [t_min_one], 0.0, name=f"g_max_{i}_{k}")
+                # --- 修正开始 ---
+                # 引入辅助变量来分解复杂的非线性表达式
+                cross_x = model.addVar(-GRB.INFINITY, GRB.INFINITY, name=f"cross_x_{i}_{k}")
+                cross_y = model.addVar(-GRB.INFINITY, GRB.INFINITY, name=f"cross_y_{i}_{k}")
+                cross_z = model.addVar(-GRB.INFINITY, GRB.INFINITY, name=f"cross_z_{i}_{k}")
                 
-                closest_pt_x = a[0] + t_clamped * line_vec[0]
-                closest_pt_y = a[1] + t_clamped * line_vec[1]
-                closest_pt_z = a[2] + t_clamped * line_vec[2]
+                model.addConstr(cross_x == point_vec_y * line_vec[2] - point_vec_z * line_vec[1])
+                model.addConstr(cross_y == point_vec_z * line_vec[0] - point_vec_x * line_vec[2])
+                model.addConstr(cross_z == point_vec_x * line_vec[1] - point_vec_y * line_vec[0])
+
+                # cross_prod_sq 是一个二次表达式
+                cross_prod_sq = cross_x*cross_x + cross_y*cross_y + cross_z*cross_z
                 
-                # 修正: 引入辅助变量 dist_sq_var 来满足 y=f(x) 格式
+                # --- 修正开始 ---
+                # 引入辅助变量 dist_sq_var 来代表距离的平方，以简化指示性约束
                 dist_sq_var = model.addVar(lb=0.0, name=f"dist_sq_var_{i}_{k}")
-                dist_sq_expr = (p[0] - closest_pt_x)**2 + (p[1] - closest_pt_y)**2 + (p[2] - closest_pt_z)**2
-                model.addConstr(dist_sq_var == dist_sq_expr, f"dist_sq_def_{i}_{k}")
-                
-                # 修正: 使用正确的Big-M约束来强制二元逻辑
-                M_dist = 1e7
-                
-                # 如果 is_blocked_by_kp[k] = 1，则必须 dist_sq_var <= effective_radius²
-                model.addConstr(dist_sq_var <= self.effective_radius**2 + M_dist * (1 - is_blocked_by_kp[k]), 
-                               f"block_if_true_{i}_{k}")
-                
-                # 如果 dist_sq_var <= effective_radius²，则必须 is_blocked_by_kp[k] = 1
-                model.addConstr(is_blocked_by_kp[k] * M_dist >= self.effective_radius**2 - dist_sq_var + 0.01, 
-                               f"block_if_close_{i}_{k}")
 
-            # d. 如果烟雾激活且至少一个关键点被遮挡，则该时刻被遮挡
-            model.addConstr(blocked[i] <= is_active, f"block_implies_active_{i}")
-            
-            # 修正: 正确使用OR约束
+                # 1. 添加一个标准的二次约束，将 dist_sq_var 与叉乘结果关联
+                #    dist_sq_var * line_len_sq >= cross_prod_sq
+                model.addQConstr(dist_sq_var * line_len_sq >= cross_prod_sq, f"dist_sq_calc_{i}_{k}")
+
+                # 2. 使用一个简单的线性指示性约束
+                #    如果 is_blocked_by_kp[k] = 1, 则 dist_sq_var <= R^2
+                model.addGenConstrIndicator(is_blocked_by_kp[k], True, 
+                                            dist_sq_var <= self.effective_radius**2)
+                # --- 修正结束 ---
+
+            # d. 遮挡逻辑：当且仅当“烟雾激活”且“所有8个关键点都被遮挡”时，才算遮挡
+            all_kp_blocked = model.addVar(vtype=GRB.BINARY, name=f"all_kp_blocked_{i}")
             kp_vars = [is_blocked_by_kp[k] for k in range(self.target_key_points.shape[0])]
-            model.addGenConstrOr(blocked[i], kp_vars, f"or_constr_{i}")
-            
-            # e. 启发式约束，缩小搜索空间
-           # if not (0.6 * missile_flight_time <= time_val <= 0.98 * missile_flight_time):
-            #     model.addConstr(blocked[i] == 0, f"force_zero_block_{i}")
+            model.addGenConstrAnd(all_kp_blocked, kp_vars, f"and_constr_all_kp_{i}")
 
+            # 最终遮挡状态
+            model.addGenConstrAnd(blocked[i], [is_active, all_kp_blocked], f"and_constr_final_{i}")
+            
         # --- 5. 目标函数 ---
         total_blocked_time = gp.quicksum(blocked[i] * dt for i in T)
         model.setObjective(total_blocked_time, GRB.MAXIMIZE)
@@ -260,7 +265,7 @@ class MissileInterferenceGurobi:
         if model.status in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
             solution = {
                 'status': 'optimal' if model.status == GRB.OPTIMAL else 'suboptimal',
-                'uav_direction': np.array([dx.x, dy.x, dz.x]),
+                'uav_direction': np.array([dx.x, dy.x, 0.0]),
                 'uav_speed': v_uav.x,
                 'drop_time': t_drop.x,
                 'explode_time': t_explode.x,
@@ -270,8 +275,13 @@ class MissileInterferenceGurobi:
             return solution
         else:
             print(f"优化失败或未找到可行解，状态码: {model.status}")
+            if model.status == GRB.INFEASIBLE:
+                print("模型不可行，正在计算IIS...")
+                model.computeIIS()
+                model.write("missile_model.ilp")
+                print("IIS已写入文件 missile_model.ilp")
             return {'status': 'failed'}
-    
+
     def _calculate_derived_results(self, solution, missile_speed):
         """计算派生结果"""
         # 无人机在投放时的位置
