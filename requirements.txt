@@ -9,3 +9,5 @@ seaborn
 jupyterlab
 openpyxl
 xlrd
+black
+ruff
