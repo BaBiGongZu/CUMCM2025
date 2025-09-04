@@ -18,6 +18,18 @@ class MissileInterferenceGurobi:
         self.real_target_radius = 7.0
         self.real_target_height = 10.0
         
+        # 真目标圆柱体上的8个关键点K
+        self.target_key_points = np.array([
+            [0, 207, 10],   # 顶面前
+            [0, 193, 10],   # 顶面后
+            [7, 200, 10],   # 顶面右
+            [-7, 200, 10],  # 顶面左
+            [0, 207, 0],    # 底面前
+            [0, 193, 0],    # 底面后
+            [7, 200, 0],    # 底面右
+            [-7, 200, 0]    # 底面左
+        ])
+        
         # 导弹M1参数
         self.missile_pos = np.array([20000.0, 0.0, 2000.0])
         self.missile_target = self.fake_target
@@ -37,8 +49,92 @@ class MissileInterferenceGurobi:
         
         print(f"导弹到假目标距离: {self.missile_distance:.2f} m")
         print(f"导弹飞行方向: {self.missile_direction}")
+        print(f"真目标关键点数量: {len(self.target_key_points)}")
+    
+    def point_to_line_distance(self, point, line_start, line_end):
+        """
+        计算点到直线的距离
         
-    def solve_gurobi_model(self, missile_speed=600.0, time_horizon=50.0, num_segments=50):
+        Args:
+            point: 点坐标 (烟雾球心)
+            line_start: 直线起点 (导弹位置)
+            line_end: 直线终点 (目标关键点)
+        
+        Returns:
+            距离值
+        """
+        # 直线方向向量
+        line_vec = line_end - line_start
+        line_length = np.linalg.norm(line_vec)
+        
+        if line_length < 1e-10:
+            return np.linalg.norm(point - line_start)
+        
+        # 单位方向向量
+        line_unit = line_vec / line_length
+        
+        # 点到直线起点的向量
+        point_vec = point - line_start
+        
+        # 投影长度
+        projection = np.dot(point_vec, line_unit)
+        
+        # 最近点在直线上的位置
+        if projection < 0:
+            # 最近点是直线起点
+            closest_point = line_start
+        elif projection > line_length:
+            # 最近点是直线终点
+            closest_point = line_end
+        else:
+            # 最近点在直线段内
+            closest_point = line_start + projection * line_unit
+        
+        # 返回距离
+        return np.linalg.norm(point - closest_point)
+    
+    def check_target_blocking(self, missile_pos, smoke_center):
+        """
+        检查烟雾是否遮挡了导弹到真目标关键点的视线
+        
+        Args:
+            missile_pos: 导弹位置
+            smoke_center: 烟雾球心位置
+        
+        Returns:
+            遮蔽的关键点数量
+        """
+        if smoke_center is None:
+            return 0
+        
+        blocked_count = 0
+        
+        for key_point in self.target_key_points:
+            # 计算烟雾球心到导弹-关键点连线的距离
+            distance = self.point_to_line_distance(smoke_center, missile_pos, key_point)
+            
+            # 如果距离小于有效半径，则该关键点被遮挡
+            if distance <= self.effective_radius:
+                blocked_count += 1
+        
+        return blocked_count
+    
+    def is_target_blocked(self, missile_pos, smoke_center, threshold=1):
+        """
+        判断目标是否被有效遮挡
+        
+        Args:
+            missile_pos: 导弹位置
+            smoke_center: 烟雾球心位置
+            threshold: 需要遮挡的最少关键点数量
+        
+        Returns:
+            是否被遮挡 (True/False)
+        """
+        blocked_count = self.check_target_blocking(missile_pos, smoke_center)
+        return blocked_count >= threshold
+        
+    def solve_gurobi_model(self, missile_speed=600.0, time_horizon=100, num_segments=1000):
         """
         使用Gurobi求解导弹干扰优化问题
         
@@ -65,7 +161,8 @@ class MissileInterferenceGurobi:
         # 无人机飞行方向 (归一化)
         dx = model.addVar(lb=-1, ub=1, name="direction_x")
         dy = model.addVar(lb=-1, ub=1, name="direction_y") 
-        dz = model.addVar(lb=-1, ub=1, name="direction_z")
+        # 强制水平飞行，z方向速度分量为0
+        dz = model.addVar(lb=0, ub=0, name="direction_z")
         
         # 无人机速度
         v_uav = model.addVar(lb=self.uav_speed_min, ub=self.uav_speed_max, name="uav_speed")
@@ -80,8 +177,8 @@ class MissileInterferenceGurobi:
             blocked[t] = model.addVar(vtype=GRB.BINARY, name=f"blocked_{t}")
         
         # 约束条件
-        # 1. 方向向量归一化
-        model.addConstr(dx*dx + dy*dy + dz*dz == 1, "unit_direction")
+        # 1. 方向向量归一化 (由于dz=0, 约束变为dx^2 + dy^2 = 1)
+        model.addConstr(dx*dx + dy*dy == 1, "unit_direction_horizontal")
         
         # 2. 起爆时间约束
         model.addConstr(t_explode >= t_drop, "explode_after_drop")
@@ -231,52 +328,39 @@ class MissileInterferenceGurobi:
         }
     
     def print_solution(self, solution):
-        """打印解决方案"""
-        print("\n" + "="*70)
-        print("导弹干扰优化解决方案 (Gurobi)")
-        print("="*70)
-        
-        if solution['status'] != 'optimal':
-            print("❌ 优化失败")
+        """打印解决方案的全部信息"""
+        if solution.get('status') != 'optimal':
+            print("❌ 优化失败或未找到可行解")
             return
-        
-        print(f"✅ 求解状态: {solution['status']}")
-        
-        print(f"\n📍 场景信息:")
-        print(f"  假目标位置: {self.fake_target}")
-        print(f"  真目标位置: {self.real_target_center}")
-        print(f"  导弹初始位置: {self.missile_pos}")
-        print(f"  无人机初始位置: {self.uav_pos}")
-        
-        print(f"\n🚀 导弹参数:")
-        print(f"  飞行速度: {solution['missile_speed']:.2f} m/s")
-        print(f"  飞行距离: {self.missile_distance:.2f} m")
-        print(f"  飞行时间: {solution['missile_flight_time']:.2f} s")
-        
-        print(f"\n✈️ 无人机最优策略:")
-        print(f"  飞行方向: ({solution['uav_direction'][0]:.3f}, {solution['uav_direction'][1]:.3f}, {solution['uav_direction'][2]:.3f})")
-        print(f"  飞行速度: {solution['uav_speed']:.2f} m/s")
-        
-        print(f"\n💣 烟雾弹参数:")
-        print(f"  投放时间: {solution['drop_time']:.2f} s")
-        print(f"  投放位置: ({solution['uav_drop_position'][0]:.1f}, {solution['uav_drop_position'][1]:.1f}, {solution['uav_drop_position'][2]:.1f})")
-        print(f"  起爆时间: {solution['explode_time']:.2f} s")
-        print(f"  起爆位置: ({solution['explode_position'][0]:.1f}, {solution['explode_position'][1]:.1f}, {solution['explode_position'][2]:.1f})")
-        print(f"  自由落体时间: {solution['fall_time']:.2f} s")
-        
+
         # 详细遮蔽分析
         blocking_result = self.simulate_detailed_blocking(solution)
+
+        print("\n" + "="*25 + " 优化结果详情 " + "="*25)
         
-        print(f"\n🎯 遮蔽效果:")
-        print(f"  优化模型预测遮蔽时间: {solution['total_blocked_time']:.2f} s")
-        print(f"  详细仿真计算遮蔽时间: {blocking_result['blocked_time']:.2f} s")
-        
+        print("\n--- 核心决策变量 ---")
+        print(f"  无人机飞行方向 (dx, dy, dz): ({solution['uav_direction'][0]:.4f}, {solution['uav_direction'][1]:.4f}, {solution['uav_direction'][2]:.4f})")
+        print(f"  无人机飞行速度: {solution['uav_speed']:.2f} m/s")
+        print(f"  烟雾弹投放时间: {solution['drop_time']:.2f} s")
+        print(f"  烟雾弹起爆时间: {solution['explode_time']:.2f} s")
+
+        print("\n--- 遮蔽效果评估 ---")
+        print(f"  Gurobi目标函数值 (估算遮蔽时间): {solution.get('objective_value', 0):.2f} s")
+        print(f"  仿真计算的总遮蔽时间: {blocking_result['blocked_time']:.2f} s")
         if blocking_result['blocking_intervals']:
-            print(f"  遮蔽时间段:")
+            print("  遮蔽时间区间:")
             for i, (start, end) in enumerate(blocking_result['blocking_intervals']):
-                print(f"    第{i+1}段: {start:.2f}s - {end:.2f}s (持续 {end-start:.2f}s)")
+                print(f"    区间 {i+1}: 从 {start:.2f}s 到 {end:.2f}s (时长: {end-start:.2f}s)")
         else:
-            print("  ⚠️ 无有效遮蔽时间段")
+            print("  无有效遮蔽时间区间。")
+
+        print("\n--- 派生关键信息 ---")
+        print(f"  导弹飞行总时间: {solution['missile_flight_time']:.2f} s (速度: {solution['missile_speed']:.1f} m/s)")
+        print(f"  烟雾弹自由落体时间: {solution['fall_time']:.2f} s")
+        print(f"  投放位置 (x, y, z): ({solution['uav_drop_position'][0]:.1f}, {solution['uav_drop_position'][1]:.1f}, {solution['uav_drop_position'][2]:.1f})")
+        print(f"  起爆位置 (x, y, z): ({solution['explode_position'][0]:.1f}, {solution['explode_position'][1]:.1f}, {solution['explode_position'][2]:.1f})")
+        
+        print("\n" + "="*60)
     
     def visualize_solution(self, solution, save_path=None):
         """可视化解决方案"""
@@ -418,7 +502,7 @@ class MissileInterferenceGurobi:
         
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"\n📊 图形已保存到: {save_path}")
+            # print(f"\n📊 图形已保存到: {save_path}") # 移除此行
         
         plt.show()
 
@@ -433,36 +517,21 @@ def main():
     
     # 求解优化问题
     try:
-        # 可以尝试不同的导弹速度
-        missile_speeds = [500, 600, 700]  # m/s
+        # 固定导弹速度为 300 m/s
+        missile_speed = 300.0  # m/s
         
-        best_solution = None
-        best_blocked_time = 0
+        print(f"\n设定导弹速度: {missile_speed} m/s")
+        solution = optimizer.solve_gurobi_model(missile_speed=missile_speed)
         
-        for speed in missile_speeds:
-            print(f"\n测试导弹速度: {speed} m/s")
-            solution = optimizer.solve_gurobi_model(missile_speed=speed)
+        if solution and solution['status'] == 'optimal':
+            print(f"\n🏆 优化求解完成:")
+            optimizer.print_solution(solution)
             
-            if solution['status'] == 'optimal':
-                # 详细仿真验证
-                blocking_result = optimizer.simulate_detailed_blocking(solution)
-                actual_blocked_time = blocking_result['blocked_time']
-                
-                print(f"遮蔽时间: {actual_blocked_time:.2f} s")
-                
-                if actual_blocked_time > best_blocked_time:
-                    best_blocked_time = actual_blocked_time
-                    best_solution = solution
-        
-        if best_solution:
-            print(f"\n🏆 最佳解决方案:")
-            optimizer.print_solution(best_solution)
-            
-            # 可视化最佳解
-            save_path = "results/figures/missile_interference_gurobi.png"
-            optimizer.visualize_solution(best_solution, save_path)
+            # # 可视化解 (已禁用)
+            # save_path = "results/figures/missile_interference_gurobi_300ms.png"
+            # optimizer.visualize_solution(solution, save_path)
         else:
-            print("❌ 未找到可行解")
+            print("❌ 未找到可行解或优化失败")
             
     except Exception as e:
         print(f"❌ 程序运行出错: {e}")
