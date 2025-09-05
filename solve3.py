@@ -64,17 +64,26 @@ def point_to_line_distance(point, line_start, line_end):
         return np.linalg.norm(point - closest_point)
 
 
-def calculate_uav_direction_from_angle(flight_angle_offset):
-    """根据角度偏移计算无人机飞行方向"""
-    uav_dir_vec_xy = TARGET_FALSE[:2] - P_FY1_0[:2]
-    base_direction_2d = uav_dir_vec_xy / np.linalg.norm(uav_dir_vec_xy)
-    cos_offset, sin_offset = np.cos(flight_angle_offset), np.sin(flight_angle_offset)
-    rotated_dir_2d = np.array([
-        cos_offset * base_direction_2d[0] - sin_offset * base_direction_2d[1],
-        sin_offset * base_direction_2d[0] + cos_offset * base_direction_2d[1]
-    ])
+def calculate_uav_direction_from_angle(flight_angle):
+    """
+    根据飞行角度计算无人机飞行方向
+    
+    Parameters:
+    -----------
+    flight_angle : float
+        飞行角度（弧度），以X轴正向为0，逆时针为正。
+    
+    Returns:
+    --------
+    np.array : 3D方向向量
+    """
+    # 基准方向为X轴正向 [1, 0]。逆时针旋转flight_angle弧度后，
+    # 新方向的坐标为 (cos(flight_angle), sin(flight_angle))
+    
     uav_direction = np.zeros(3)
-    uav_direction[:2] = rotated_dir_2d
+    uav_direction[0] = np.cos(flight_angle)
+    uav_direction[1] = np.sin(flight_angle)
+    
     return uav_direction
 
 
@@ -82,14 +91,14 @@ def objective_function_3_grenades(params):
     """
     多枚烟雾弹协同遮蔽的目标函数
     
-    params: [uav_speed, flight_angle_offset, 
+    params: [uav_speed, flight_angle, 
              t_drop1, t_drop_interval2, t_drop_interval3,
              t_explode_delay1, t_explode_delay2, t_explode_delay3]
     """
-    uav_speed, angle_offset, t_d1, t_di2, t_di3, t_ed1, t_ed2, t_ed3 = params
+    uav_speed, flight_angle, t_d1, t_di2, t_di3, t_ed1, t_ed2, t_ed3 = params
     
     # 1. 计算无人机和炸弹的运动学
-    uav_direction = calculate_uav_direction_from_angle(angle_offset)
+    uav_direction = calculate_uav_direction_from_angle(flight_angle)
     uav_velocity_vec = uav_speed * uav_direction
     
     drop_times = [
@@ -169,19 +178,19 @@ def objective_function_3_grenades(params):
 
 def print_solution_details(params, duration):
     """打印3枚弹的解的详细信息"""
-    uav_speed, angle_offset, t_d1, t_di2, t_di3, t_ed1, t_ed2, t_ed3 = params
+    uav_speed, flight_angle, t_d1, t_di2, t_di3, t_ed1, t_ed2, t_ed3 = params
     
     print(f"\n找到最优策略（3枚烟雾弹）：")
     print(f"  > 最大有效遮蔽时长: {duration:.6f} 秒")
     print("-" * 60)
     print(f"无人机飞行速度: {uav_speed:.4f} m/s")
-    print(f"飞行角度偏移: {angle_offset:.6f} 弧度 ({math.degrees(angle_offset):.2f}°)")
+    print(f"飞行角度: {flight_angle:.6f} 弧度 ({math.degrees(flight_angle):.2f}°)")
     print("-" * 60)
     
     drop_times = [t_d1, t_d1 + t_di2, t_d1 + t_di2 + t_di3]
     explode_delays = [t_ed1, t_ed2, t_ed3]
     
-    uav_direction = calculate_uav_direction_from_angle(angle_offset)
+    uav_direction = calculate_uav_direction_from_angle(flight_angle)
     uav_velocity_vec = uav_speed * uav_direction
 
     for i in range(NUM_GRENADES):
@@ -210,22 +219,25 @@ if __name__ == "__main__":
     # 优化变量边界: 8个变量
     bounds = [
         (70.0, 140.0),      # uav_speed (m/s)
-        (-np.pi, np.pi),    # flight_angle_offset (rad)
+        (0, 2 * np.pi),     # flight_angle (rad)
         (0.1, 10.0),        # t_drop1 (s)
-        (MIN_DROP_INTERVAL, 5.0), # t_drop_interval2 (s)
-        (MIN_DROP_INTERVAL, 5.0), # t_drop_interval3 (s)
-        (0.1, 10.0),        # t_explode_delay1 (s)
-        (0.1, 10.0),        # t_explode_delay2 (s)
-        (0.1, 10.0)         # t_explode_delay3 (s)
+        (MIN_DROP_INTERVAL, 10.0), # t_drop_interval2 (s)
+        (MIN_DROP_INTERVAL, 10.0), # t_drop_interval3 (s)
+        (0.0, 20.0),        # t_explode_delay1 (s)
+        (0.0, 20.0),        # t_explode_delay2 (s)
+        (0.0, 20.0)         # t_explode_delay3 (s)
     ]
     
     # 使用一个合理的猜测作为种子
+    # 注意：由于角度定义已更改，旧种子中的角度值可能不再适用。
+    # 例如，旧的-3.0弧度现在可能需要表示为 pi/2 附近的值。
+    # 优化器仍会从这个点开始搜索。
     seed = np.array([
-        [130.0, -3.0, 2.0, 1.5, 1.5, 0.8, 0.8, 0.8]
+        [130.0, 1.57, 2.0, 1.5, 1.5, 0.8, 0.8, 0.8] # 将角度种子改为一个更直观的猜测(朝向Y轴正向)
     ])
     
     # 生成初始种群
-    TOTAL_POPSIZE = 500 # 增加种群大小以应对更复杂的问题
+    TOTAL_POPSIZE = 300 # 增加种群大小以应对更复杂的问题
     num_random_individuals = TOTAL_POPSIZE - len(seed)
     num_vars = len(bounds)
     
@@ -244,7 +256,7 @@ if __name__ == "__main__":
         objective_function_3_grenades,
         bounds,
         init=full_init_population,
-        strategy='rand1bin', # 使用探索性更强的策略
+        strategy='best1bin', # 使用探索性更强的策略
         maxiter=1000,
         popsize=20, # popsize是乘数因子
         tol=0.01,
