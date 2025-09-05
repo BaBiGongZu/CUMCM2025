@@ -369,17 +369,18 @@ if __name__ == "__main__":
     bounds = [
         (70.0, 140.0),      # uav_speed (m/s)
         (0, 2 * np.pi),     # flight_angle (rad)
-        (0.1, 10.0),        # t_drop (s)
-        (0.1, 10.0)         # t_explode_delay (s)
+        (0.0, 10.0),        # t_drop (s)
+        (0.0, 10.0)         # t_explode_delay (s)
     ]
     
     # 使用已知的较好种子
     seed = np.array([[
-        135.0596, 0.110243, 0.1983, 0.6139
+        # 135.0596, 0.110243, 0.1983, 0.6139
+        134.302340292277, 0.088445143950, 0.767470916269, 0.196204160294
     ]])
     
     # 生成初始种群
-    TOTAL_POPSIZE = 500  # 由于C加速，可以使用更大的种群
+    TOTAL_POPSIZE = 1000  # 由于C加速，可以使用更大的种群
     num_random_individuals = TOTAL_POPSIZE - 1
     num_vars = len(bounds)
     
