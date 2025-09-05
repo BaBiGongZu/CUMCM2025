@@ -31,11 +31,22 @@ MIN_DROP_INTERVAL = 1.0
 OPTIMIZER_TIME_STEP = 0.01 # 适当增大步长以加快计算速度
 
 
-def _generate_target_key_points(num_points_per_circle=50):
-    """生成目标关键点"""
+def _generate_target_key_points(num_points_per_circle=20, num_height_levels=10):
+    """
+    生成目标关键点, 在圆柱体侧面均匀取点
+    
+    Parameters:
+    -----------
+    num_points_per_circle : int
+        每个高度层上圆周的点数
+    num_height_levels : int
+        高度层数
+    """
     key_points = []
     angles = np.linspace(0, 2*np.pi, num_points_per_circle, endpoint=False)
-    for h in [0.0, REAL_TARGET_HEIGHT]:
+    heights = np.linspace(0.0, REAL_TARGET_HEIGHT, num_height_levels)
+    
+    for h in heights:
         for angle in angles:
             key_points.append([
                 REAL_TARGET_CENTER[0] + REAL_TARGET_RADIUS * np.cos(angle),
@@ -44,7 +55,7 @@ def _generate_target_key_points(num_points_per_circle=50):
             ])
     return np.array(key_points)
 
-TARGET_KEY_POINTS = _generate_target_key_points(num_points_per_circle=50)
+TARGET_KEY_POINTS = _generate_target_key_points(num_points_per_circle=10, num_height_levels=10)
 
 
 def point_to_line_distance(point, line_start, line_end):
@@ -233,11 +244,11 @@ if __name__ == "__main__":
     # 例如，旧的-3.0弧度现在可能需要表示为 pi/2 附近的值。
     # 优化器仍会从这个点开始搜索。
     seed = np.array([
-        [130.0, 1.57, 2.0, 1.5, 1.5, 0.8, 0.8, 0.8] # 将角度种子改为一个更直观的猜测(朝向Y轴正向)
+        [130.0, 0.1, 0.0, 0, 0, 0.0, 0.0, 0.0] # 将角度种子改为一个更直观的猜测(朝向Y轴正向)
     ])
     
     # 生成初始种群
-    TOTAL_POPSIZE = 300 # 增加种群大小以应对更复杂的问题
+    TOTAL_POPSIZE = 500 # 增加种群大小以应对更复杂的问题
     num_random_individuals = TOTAL_POPSIZE - len(seed)
     num_vars = len(bounds)
     
@@ -258,7 +269,7 @@ if __name__ == "__main__":
         init=full_init_population,
         strategy='best1bin', # 使用探索性更强的策略
         maxiter=1000,
-        popsize=20, # popsize是乘数因子
+        popsize=30, # popsize是乘数因子
         tol=0.01,
         recombination=0.8,
         mutation=(0.7, 1.5),
