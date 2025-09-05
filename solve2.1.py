@@ -26,7 +26,7 @@ V_SMOKE_SINK_SPEED = 3.0  # 下沉速度标量
 SMOKE_DURATION = 20.0
 
 # 优化器参数
-OPTIMIZER_TIME_STEP = 0.01
+OPTIMIZER_TIME_STEP = 0.001
 
 
 def _generate_target_key_points(num_points_per_circle=50):
@@ -77,34 +77,25 @@ def point_to_line_distance(point, line_start, line_end):
     return np.linalg.norm(point - closest_point)
 
 
-def calculate_uav_direction_from_angle(flight_angle_offset):
+def calculate_uav_direction_from_angle(flight_angle):
     """
-    根据角度偏移计算无人机飞行方向
+    根据飞行角度计算无人机飞行方向
     
     Parameters:
     -----------
-    flight_angle_offset : float
-        相对于朝向假目标方向的角度偏移（弧度）
+    flight_angle : float
+        飞行角度（弧度），以X轴正向为0，逆时针为正。
     
     Returns:
     --------
     np.array : 3D方向向量
     """
-    # 基准方向：朝向假目标
-    uav_dir_vec_xy = TARGET_FALSE[:2] - P_FY1_0[:2]
-    base_direction_2d = uav_dir_vec_xy / np.linalg.norm(uav_dir_vec_xy)
-    
-    # 应用角度偏移
-    cos_offset = np.cos(flight_angle_offset)
-    sin_offset = np.sin(flight_angle_offset)
-    
-    rotated_dir_2d = np.array([
-        cos_offset * base_direction_2d[0] - sin_offset * base_direction_2d[1],
-        sin_offset * base_direction_2d[0] + cos_offset * base_direction_2d[1]
-    ])
+    # 基准方向为X轴正向 [1, 0]。逆时针旋转flight_angle弧度后，
+    # 新方向的坐标为 (cos(flight_angle), sin(flight_angle))
     
     uav_direction = np.zeros(3)
-    uav_direction[:2] = rotated_dir_2d
+    uav_direction[0] = np.cos(flight_angle)
+    uav_direction[1] = np.sin(flight_angle)
     
     return uav_direction
 
@@ -116,13 +107,13 @@ def corrected_objective_function(params):
     Parameters:
     -----------
     params : array-like
-        [uav_speed, flight_angle_offset, t_drop, t_explode_delay]
+        [uav_speed, flight_angle, t_drop, t_explode_delay]
         - uav_speed: 无人机速度 (m/s)
-        - flight_angle_offset: 相对于朝向假目标的角度偏移 (弧度)
+        - flight_angle: 飞行角度 (弧度), 以X轴正向为0, 逆时针为正
         - t_drop: 投放时间 (s)
         - t_explode_delay: 投放后到起爆的延迟时间 (s)
     """
-    uav_speed, flight_angle_offset, t_drop, t_explode_delay = params
+    uav_speed, flight_angle, t_drop, t_explode_delay = params
     
     # 计算总起爆时间
     t_explode_abs = t_drop + t_explode_delay
@@ -131,8 +122,8 @@ def corrected_objective_function(params):
     if t_explode_abs >= MISSILE_FLIGHT_TIME:
         return 0.0
     
-    # 1. 计算无人机飞行方向（严谨的角度计算）
-    uav_direction = calculate_uav_direction_from_angle(flight_angle_offset)
+    # 1. 计算无人机飞行方向（基于X轴正向的绝对角度）
+    uav_direction = calculate_uav_direction_from_angle(flight_angle)
     
     # 2. 计算烟雾弹投放位置（第一阶段：无人机飞行）
     uav_drop_pos = P_FY1_0 + uav_speed * t_drop * uav_direction
@@ -192,10 +183,10 @@ def corrected_objective_function(params):
 
 def print_solution_details(params, duration):
     """打印解的详细信息"""
-    uav_speed, flight_angle_offset, t_drop, t_explode_delay = params
+    uav_speed, flight_angle, t_drop, t_explode_delay = params
     t_explode_abs = t_drop + t_explode_delay
     
-    uav_direction = calculate_uav_direction_from_angle(flight_angle_offset)
+    uav_direction = calculate_uav_direction_from_angle(flight_angle)
     uav_drop_pos = P_FY1_0 + uav_speed * t_drop * uav_direction
     bomb_initial_velocity = uav_speed * uav_direction
     explode_pos = uav_drop_pos.copy()
@@ -206,7 +197,7 @@ def print_solution_details(params, duration):
     print(f"  > 最大有效遮蔽时长: {duration:.6f} 秒")
     print("-" * 60)
     print(f"  无人机飞行速度: {uav_speed:.4f} m/s")
-    print(f"  飞行角度偏移: {flight_angle_offset:.6f} 弧度 ({math.degrees(flight_angle_offset):.2f}°)")
+    print(f"  飞行角度: {flight_angle:.6f} 弧度 ({math.degrees(flight_angle):.2f}°)")
     print(f"  受领任务后投放时间: {t_drop:.4f} s")
     print(f"  投放后起爆延迟: {t_explode_delay:.4f} s")
     print(f"  总起爆时间: {t_explode_abs:.4f} s")
@@ -229,13 +220,16 @@ if __name__ == "__main__":
     # 优化变量边界
     bounds = [
         (70.0, 140.0),      # uav_speed (m/s)
-        (-np.pi, np.pi),    # flight_angle_offset (rad) - 允许全方向
+        (0, 2 * np.pi),     # flight_angle (rad) - 0到2pi
         (0.1, 10.0),        # t_drop (s) - 合理的投放时间范围
         (0.1, 10.0)         # t_explode_delay (s) - 合理的起爆延迟
     ]
     
+    # 注意：由于角度定义已更改，旧的种子可能不再适用或不再是优解。
+    # 可以注释掉种子，让优化器从头开始搜索，或者根据新角度定义提供一个新种子。
+    # 这里我们先注释掉旧种子。
     seed = np.array([[
-        128.455022929791, -3.039913924593, 0.377478425081, 0.491461787664
+         123.809213143700, 0.096794168049, 0.570658303297, 0.405527351181
     ]])
     
     # 生成初始种群
@@ -252,7 +246,7 @@ if __name__ == "__main__":
     
     full_init_population = np.vstack((seed, scaled_random_init))
     
-    print(f"初始种群大小: {TOTAL_POPSIZE}")
+    print(f"初始种群大小: {TOTAL_POPSIZE} (包含1个种子)")
     print("开始优化...")
     
     # 差分进化优化
@@ -260,11 +254,11 @@ if __name__ == "__main__":
         corrected_objective_function,
         bounds,
         init=full_init_population,
-        strategy='best1bin',
+        strategy='rand1bin',
         maxiter=500,  # 适当减少迭代次数以节省时间
         tol=0.01,
         recombination=0.7,
-        mutation=(0.5, 1.0),
+        mutation=(0.5, 1.0), # 稍微减小变异范围，进行精细搜索
         disp=True,
         workers=-1,
         seed=42  # 固定随机种子以便重现
@@ -290,7 +284,7 @@ if __name__ == "__main__":
         print(f"\n🔍 验证提示：")
         print(f"在check.py中使用以下参数验证结果：")
         print(f"  uav_speed={best_params[0]:.6f}")
-        print(f"  flight_angle_offset={best_params[1]:.6f}")
+        print(f"  flight_angle={best_params[1]:.6f}")
         print(f"  t_drop={best_params[2]:.6f}")
         print(f"  t_explode_delay={best_params[3]:.6f}")
         
