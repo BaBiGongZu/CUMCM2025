@@ -109,6 +109,8 @@ class MissileInterferenceGurobi:
             # 如果距离小于有效半径，则该关键点被遮挡
             if distance <= self.effective_radius:
                 blocked_count += 1
+            else:
+                return 0  # 只要有一个关键点未被遮挡，立即返回0
         
         return blocked_count
     
@@ -176,7 +178,7 @@ class MissileInterferenceGurobi:
         model.addConstr(t_explode >= t_drop, "explode_after_drop")
         model.addQConstr(uav_dist == v_uav * t_explode, "uav_dist_constr")
 
-        # --- 3. 派生变量 (用Gurobi表达式定义轨迹) ---
+        # --- 3. 派生变量 ---
         fall_time = t_explode - t_drop
         
         # 起爆位置表达式 (使用辅助变量 uav_dist，避免三变量乘积)
