@@ -222,7 +222,7 @@ if __name__ == "__main__":
         [139.976844, 3.135471, 0.001625, 3.656653, 1.919484, 3.609524, 5.341602, 6.039781]
     ]
     
-    TOTAL_POPSIZE = 10000
+    TOTAL_POPSIZE = 1000
     num_seeds = len(heuristic_seeds)
     num_random = TOTAL_POPSIZE - num_seeds
     
@@ -246,7 +246,7 @@ if __name__ == "__main__":
         init=initial_population,
         strategy='best1bin', # 使用 'best1bin' 策略以利用种子
         maxiter=5000,
-        popsize=20,
+        popsize=200,
         tol=0.001,
         recombination=0.7,
         mutation=(0.7, 1.0),
