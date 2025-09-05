@@ -133,8 +133,6 @@ def objective_function_3_grenades(params):
         explode_pos = uav_drop_pos + uav_velocity_vec * t_explode_delay
         explode_pos[2] -= 0.5 * G_ACCEL * t_explode_delay**2
         
-        if explode_pos[2] <= REAL_TARGET_HEIGHT:
-            continue
             
         grenades_info.append({
             'explode_pos': explode_pos,
@@ -244,7 +242,7 @@ if __name__ == "__main__":
     # 例如，旧的-3.0弧度现在可能需要表示为 pi/2 附近的值。
     # 优化器仍会从这个点开始搜索。
     seed = np.array([
-        [130.0, 0.1, 0.0, 0, 0, 0.0, 0.0, 0.0] # 将角度种子改为一个更直观的猜测(朝向Y轴正向)
+        [130.0, 0.1, 0, 1, 1, 0.0, 0.0, 0.0] # 将角度种子改为一个更直观的猜测(朝向Y轴正向)
     ])
     
     # 生成初始种群
