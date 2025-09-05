@@ -203,9 +203,113 @@ SMOKE_DURATION = 20.0
 OPTIMIZER_TIME_STEP = 0.01  # 适当调整以平衡精度和性能
 NUM_SMOKE_BOMBS = 3  # 问题三要求投放3枚烟幕干扰弹
 
-# 初始化C库
-print("🔧 初始化多烟雾弹C库...")
-c_smoke_lib = MultiCloudSmokeBlockingLib()
+# C库全局变量（延迟初始化）
+c_smoke_lib = None
+
+def get_smoke_lib():
+    """获取C库实例，使用单例模式避免重复初始化"""
+    global c_smoke_lib
+    if c_smoke_lib is None:
+        print("🔧 初始化多烟雾弹C库...")
+        c_smoke_lib = MultiCloudSmokeBlockingLib()
+    return c_smoke_lib
+
+# 为多进程优化：将C库调用封装为独立函数
+def calculate_multiple_clouds_duration_mp(missile_start, missile_velocity, explode_positions, 
+                                         t_start, t_end, time_step, sink_speed):
+    """
+    多进程安全的烟雾弹遮蔽时长计算函数
+    每个进程会独立初始化C库
+    """
+    lib = get_smoke_lib()
+    return lib.calculate_multiple_clouds_duration(
+        missile_start, missile_velocity, explode_positions, 
+        t_start, t_end, time_step, sink_speed
+    )
+
+def init_worker_process():
+    """
+    工作进程初始化函数
+    在每个工作进程启动时调用，确保C库正确初始化
+    """
+    global c_smoke_lib
+    c_smoke_lib = None  # 重置全局变量
+    # 预先初始化C库以避免竞态条件
+    try:
+        get_smoke_lib()
+        print(f"✅ 工作进程 {os.getpid()} C库初始化成功")
+    except Exception as e:
+        print(f"❌ 工作进程 {os.getpid()} C库初始化失败: {e}")
+
+def three_bombs_objective_function_mp(params):
+    """
+    多进程优化版本的目标函数
+    使用独立的C库调用函数，避免序列化问题
+    """
+    try:
+        # 解码参数
+        trajectory_info = decode_params_to_trajectories(params)
+        explode_times = trajectory_info['explode_times']
+        trajectories = trajectory_info['trajectories']
+        
+        # 检查所有起爆时间是否合理
+        for i, t_explode in enumerate(explode_times):
+            if t_explode >= MISSILE_FLIGHT_TIME:
+                return 0.0  # 起爆时间过晚
+            
+            if trajectories[i]['explode_pos'][2] <= REAL_TARGET_HEIGHT:
+                return 0.0  # 起爆高度过低
+        
+        # 计算所有烟幕弹的有效时间段
+        smoke_periods = []
+        for i, t_explode in enumerate(explode_times):
+            t_start = t_explode
+            t_end = min(t_explode + SMOKE_DURATION, MISSILE_FLIGHT_TIME)
+            if t_start < t_end:
+                smoke_periods.append((t_start, t_end, i))
+        
+        if not smoke_periods:
+            return 0.0
+        
+        # 创建时间事件列表
+        events = []
+        for t_start, t_end, bomb_idx in smoke_periods:
+            events.append((t_start, 'start', bomb_idx))
+            events.append((t_end, 'end', bomb_idx))
+        
+        # 按时间排序
+        events.sort()
+        
+        total_duration = 0.0
+        active_bombs = set()
+        last_time = None
+        
+        # 扫描时间线
+        for event_time, event_type, bomb_idx in events:
+            # 如果有活跃的烟幕弹，计算这段时间的遮蔽效果
+            if active_bombs and last_time is not None and event_time > last_time:
+                active_positions = [trajectories[i]['explode_pos'] for i in active_bombs]
+                
+                # 使用多进程安全的C库调用
+                duration = calculate_multiple_clouds_duration_mp(
+                    P_M1_0, VEC_V_M1, active_positions,
+                    last_time, event_time, OPTIMIZER_TIME_STEP, V_SMOKE_SINK_SPEED
+                )
+                total_duration += duration
+            
+            # 更新活跃烟幕弹集合
+            if event_type == 'start':
+                active_bombs.add(bomb_idx)
+            else:
+                active_bombs.discard(bomb_idx)
+            
+            last_time = event_time
+        
+        return -total_duration  # 负值用于最大化
+        
+    except Exception as e:
+        print(f"目标函数计算出错: {e}")
+        return 0.0
 
 def calculate_uav_direction_from_angle(flight_angle):
     """根据飞行角度计算无人机飞行方向"""
@@ -221,17 +325,25 @@ def decode_params_to_trajectories(params):
     Parameters:
     -----------
     params : array-like
-        优化参数 [uav_speed, flight_angle, t_drop1, t_delay1, t_drop2, t_delay2, t_drop3, t_delay3]
+        优化参数 [uav_speed, flight_angle, t_drop1, t_delay1, interval2, t_delay2, interval3, t_delay3]
         - uav_speed: 无人机飞行速度
         - flight_angle: 无人机飞行角度
-        - t_drop1, t_drop2, t_drop3: 3枚烟幕弹的投放时间
-        - t_delay1, t_delay2, t_delay3: 3枚烟幕弹的起爆延迟
+        - t_drop1: 第1枚烟幕弹的投放时间(绝对时间)
+        - t_delay1: 第1枚烟幕弹的起爆延迟
+        - interval2: 第2枚相对第1枚的投放间隔时间
+        - t_delay2: 第2枚烟幕弹的起爆延迟
+        - interval3: 第3枚相对第2枚的投放间隔时间
+        - t_delay3: 第3枚烟幕弹的起爆延迟
     
     Returns:
     --------
     dict: 包含轨迹信息的字典
     """
-    uav_speed, flight_angle, t_drop1, t_delay1, t_drop2, t_delay2, t_drop3, t_delay3 = params
+    uav_speed, flight_angle, t_drop1, t_delay1, interval2, t_delay2, interval3, t_delay3 = params
+    
+    # 计算绝对投放时间
+    t_drop2 = t_drop1 + interval2
+    t_drop3 = t_drop2 + interval3
     
     # 计算无人机飞行方向
     uav_direction = calculate_uav_direction_from_angle(flight_angle)
@@ -267,7 +379,8 @@ def decode_params_to_trajectories(params):
         'flight_angle': flight_angle,
         'uav_direction': uav_direction,
         'trajectories': trajectories,
-        'explode_times': explode_times
+        'explode_times': explode_times,
+        'drop_intervals': [interval2, interval3]  # 添加间隔信息用于调试
     }
 
 def three_bombs_objective_function(params):
@@ -324,7 +437,7 @@ def three_bombs_objective_function(params):
                 active_positions = [trajectories[i]['explode_pos'] for i in active_bombs]
                 
                 # 使用C库计算这个时间段的遮蔽时长
-                duration = c_smoke_lib.calculate_multiple_clouds_duration(
+                duration = get_smoke_lib().calculate_multiple_clouds_duration(
                     P_M1_0, VEC_V_M1, active_positions,
                     last_time, event_time, OPTIMIZER_TIME_STEP, V_SMOKE_SINK_SPEED
                 )
@@ -352,25 +465,29 @@ def validate_trajectory_constraints(params, verbose=False):
     --------
     bool: 是否满足约束
     """
-    uav_speed, flight_angle, t_drop1, t_delay1, t_drop2, t_delay2, t_drop3, t_delay3 = params
+    uav_speed, flight_angle, t_drop1, t_delay1, interval2, t_delay2, interval3, t_delay3 = params
     
     constraint_violations = []
     
-    # 检查投放时间间隔（至少1秒）
-    drop_times = [t_drop1, t_drop2, t_drop3]
-    drop_times_with_idx = [(t_drop1, 1), (t_drop2, 2), (t_drop3, 3)]
-    drop_times_with_idx.sort()
+    # 检查投放时间间隔（现在由参数结构自然保证 >= 0）
+    if interval2 < 1.0:
+        constraint_violations.append(f"第2枚投放间隔不足: {interval2:.3f}s < 1.0s")
     
-    for i in range(1, len(drop_times_with_idx)):
-        interval = drop_times_with_idx[i][0] - drop_times_with_idx[i-1][0]
-        if interval < 1.0:
-            constraint_violations.append(
-                f"投放间隔不足: 第{drop_times_with_idx[i-1][1]}枚与第{drop_times_with_idx[i][1]}枚间隔{interval:.3f}s < 1.0s"
-            )
+    if interval3 < 1.0:
+        constraint_violations.append(f"第3枚投放间隔不足: {interval3:.3f}s < 1.0s")
     
     # 检查速度范围
     if uav_speed < 70 or uav_speed > 140:
         constraint_violations.append(f"无人机速度超出范围: {uav_speed:.3f} m/s (要求: 70-140 m/s)")
+    
+    # 检查时间参数的基本合理性
+    time_params = [(t_drop1, "第1枚投放时间"), (t_delay1, "第1枚延迟时间"), 
+                   (interval2, "第2枚投放间隔"), (t_delay2, "第2枚延迟时间"),
+                   (interval3, "第3枚投放间隔"), (t_delay3, "第3枚延迟时间")]
+    
+    for t, name in time_params:
+        if t < 0.1:
+            constraint_violations.append(f"{name}过小: {t:.3f}s < 0.1s")
     
     # 检查起爆时间和高度
     trajectory_info = decode_params_to_trajectories(params)
@@ -439,7 +556,7 @@ def debug_time_calculation(params, detailed=True):
             active_positions = [trajectories[i]['explode_pos'] for i in active_bombs]
             
             # 使用C库计算这个时间段的遮蔽时长
-            duration = c_smoke_lib.calculate_multiple_clouds_duration(
+            duration = get_smoke_lib().calculate_multiple_clouds_duration(
                 P_M1_0, VEC_V_M1, active_positions,
                 last_time, event_time, OPTIMIZER_TIME_STEP, V_SMOKE_SINK_SPEED
             )
@@ -469,10 +586,11 @@ def debug_time_calculation(params, detailed=True):
     return total_duration
 
 def print_solution_details(params, duration):
-    """打印解的详细信息"""
+    """打印解的详细信息 (新版本：相对时间间隔)"""
     trajectory_info = decode_params_to_trajectories(params)
+    uav_speed, flight_angle, t_drop1, t_delay1, interval2, t_delay2, interval3, t_delay3 = params
     
-    print(f"\n找到最优三烟幕弹策略（C库加速版本）：")
+    print(f"\n找到最优三烟幕弹策略（C库加速版本 - 相对时间间隔）：")
     print(f"  > 最大有效遮蔽时长: {duration:.6f} 秒")
     print("=" * 80)
     
@@ -481,10 +599,15 @@ def print_solution_details(params, duration):
     print(f"  飞行角度: {trajectory_info['flight_angle']:.6f} 弧度 ({math.degrees(trajectory_info['flight_angle']):.2f}°)")
     print(f"  飞行方向: [{trajectory_info['uav_direction'][0]:.6f}, {trajectory_info['uav_direction'][1]:.6f}, {trajectory_info['uav_direction'][2]:.6f}]")
     
+    print(f"\n投放时间参数 (新结构):")
+    print(f"  第1枚投放时间: {t_drop1:.4f} s (绝对时间)")
+    print(f"  第2枚投放间隔: {interval2:.4f} s (相对第1枚)")
+    print(f"  第3枚投放间隔: {interval3:.4f} s (相对第2枚)")
+    
     print(f"\n烟幕干扰弹详情:")
     for i, traj in enumerate(trajectory_info['trajectories'], 1):
         print(f"  第{i}枚烟幕弹:")
-        print(f"    投放时间: {traj['t_drop']:.4f} s")
+        print(f"    投放时间: {traj['t_drop']:.4f} s (绝对时间)")
         print(f"    起爆延迟: {traj['t_delay']:.4f} s")
         print(f"    起爆时间: {traj['t_explode']:.4f} s")
         print(f"    投放位置: [{traj['drop_pos'][0]:.2f}, {traj['drop_pos'][1]:.2f}, {traj['drop_pos'][2]:.2f}]")
@@ -494,8 +617,9 @@ def print_solution_details(params, duration):
     drop_times = [traj['t_drop'] for traj in trajectory_info['trajectories']]
     drop_times.sort()
     print(f"\n投放时间序列: {[f'{t:.3f}s' for t in drop_times]}")
-    intervals = [drop_times[i] - drop_times[i-1] for i in range(1, len(drop_times))]
-    print(f"投放间隔: {[f'{interval:.3f}s' for interval in intervals]} (要求≥1.0s)")
+    actual_intervals = [drop_times[i] - drop_times[i-1] for i in range(1, len(drop_times))]
+    print(f"实际投放间隔: {[f'{interval:.3f}s' for interval in actual_intervals]} (要求≥1.0s)")
+    print(f"设定投放间隔: [{interval2:.3f}s, {interval3:.3f}s]")
     
     print("=" * 80)
 
@@ -592,46 +716,48 @@ if __name__ == "__main__":
     print(f"烟幕弹数量: {NUM_SMOKE_BOMBS}")
     print(f"时间步长: {OPTIMIZER_TIME_STEP:.3f} s")
     
-    # 参数边界 - 修正投放时间边界以确保间隔约束
+    # 参数边界 - 新版本：使用相对时间间隔
     bounds = [
         (70.0, 140.0),     # uav_speed
         (0, 2 * np.pi),    # flight_angle
-        (0, 15.0),       # t_drop1 (第一次投放)
-        (0, 20.0),       # t_delay1
-        (1, 16.0),       # t_drop2 (确保与第一次投放间隔至少1秒: t_drop1_min + 1.0 = 0.5 + 1.0 = 1.5)
-        (0, 20.0),       # t_delay2
-        (2, 17.0),       # t_drop3 (确保与第二次投放间隔至少1秒: t_drop2_min + 1.0 = 1.5 + 1.0 = 2.5)
-        (0, 20.0),       # t_delay3
+        (0.1, 15.0),       # t_drop1 (第1枚投放时间，绝对时间)
+        (0.1, 20.0),       # t_delay1 (第1枚起爆延迟)
+        (1.0, 10.0),       # interval2 (第2枚相对第1枚的投放间隔，≥1秒)
+        (0.1, 20.0),       # t_delay2 (第2枚起爆延迟)
+        (1.0, 10.0),       # interval3 (第3枚相对第2枚的投放间隔，≥1秒)
+        (0.1, 20.0),       # t_delay3 (第3枚起爆延迟)
     ]
     
-    print(f"参数边界说明:")
+    print(f"参数边界说明 (新版本: 相对时间间隔):")
     print(f"  无人机速度: {bounds[0][0]:.1f} - {bounds[0][1]:.1f} m/s")
     print(f"  飞行角度: {bounds[1][0]:.3f} - {bounds[1][1]:.3f} rad")
-    print(f"  第1次投放时间: {bounds[2][0]:.1f} - {bounds[2][1]:.1f} s")
-    print(f"  第2次投放时间: {bounds[4][0]:.1f} - {bounds[4][1]:.1f} s (确保≥第1次+1s)")
-    print(f"  第3次投放时间: {bounds[6][0]:.1f} - {bounds[6][1]:.1f} s (确保≥第2次+1s)")
-    print(f"  延迟时间范围: {bounds[3][0]:.1f} - {bounds[3][1]:.1f} s (所有烟幕弹)")
+    print(f"  第1枚投放时间: {bounds[2][0]:.1f} - {bounds[2][1]:.1f} s (绝对时间)")
+    print(f"  第1枚起爆延迟: {bounds[3][0]:.1f} - {bounds[3][1]:.1f} s")
+    print(f"  第2枚投放间隔: {bounds[4][0]:.1f} - {bounds[4][1]:.1f} s (相对第1枚)")
+    print(f"  第2枚起爆延迟: {bounds[5][0]:.1f} - {bounds[5][1]:.1f} s")
+    print(f"  第3枚投放间隔: {bounds[6][0]:.1f} - {bounds[6][1]:.1f} s (相对第2枚)")
+    print(f"  第3枚起爆延迟: {bounds[7][0]:.1f} - {bounds[7][1]:.1f} s")
     print()
     
     # 初始化种群（使用一些启发式种子）
-    TOTAL_POPSIZE = 1500
+    TOTAL_POPSIZE = 1000
     
-    # 创建一些启发式种子 - 更新以符合新的边界约束
+    # 创建一些启发式种子 - 新版本：使用相对时间间隔
     heuristic_seeds = [
-        # 均匀时间分布策略
-        [120.0, 0.0, 1.0, 3.0, 3.0, 3.5, 5.0, 4.0],
-        [110.0, 0.1, 1.5, 2.5, 4.0, 3.0, 6.5, 3.5],
-        [130.0, -0.1, 0.8, 4.0, 2.8, 2.8, 4.8, 4.2],
+        # 均匀时间分布策略 
+        [120.0, 0.0, 1.0, 3.0, 2.0, 3.5, 2.0, 4.0],    # t_drop1=1.0, t_drop2=3.0, t_drop3=5.0
+        [110.0, 0.1, 1.5, 2.5, 2.5, 3.0, 2.0, 3.5],    # t_drop1=1.5, t_drop2=4.0, t_drop3=6.0
+        [130.0, -0.1, 0.5, 4.0, 1.5, 2.8, 1.5, 4.2],   # t_drop1=0.5, t_drop2=2.0, t_drop3=3.5
         # 快速连发策略
-        [125.0, 0.05, 1.0, 2.0, 2.5, 2.5, 4.0, 3.0],
+        [125.0, 0.05, 1.0, 2.0, 1.0, 2.5, 1.0, 3.0],   # t_drop1=1.0, t_drop2=2.0, t_drop3=3.0
         # 延迟爆炸策略
-        [115.0, 0.0, 2.0, 5.0, 4.0, 5.5, 6.0, 6.0],
+        [115.0, 0.0, 2.0, 5.0, 2.0, 5.5, 2.0, 6.0],    # t_drop1=2.0, t_drop2=4.0, t_drop3=6.0
         # 紧密间隔策略
-        [105.0, 0.2, 0.5, 1.5, 1.5, 1.8, 2.5, 2.0],
+        [105.0, 0.2, 0.5, 1.5, 1.0, 1.8, 1.0, 2.0],    # t_drop1=0.5, t_drop2=1.5, t_drop3=2.5
         # 分散时间策略
-        [135.0, -0.2, 2.5, 3.0, 5.5, 4.0, 8.5, 3.5],
-        # 跑出来的最优
-        [116.5987, 0.115535, 0, 0.0074, 1.0043, 1, 8, 13]
+        [135.0, -0.2, 2.5, 3.0, 3.0, 4.0, 3.0, 3.5],   # t_drop1=2.5, t_drop2=5.5, t_drop3=8.5
+        # 手动跑的优化
+        [140, 0.078378, 0.102, 0.802, 1.160, 4.2, 1.18, 11]
     ]
     
     num_seeds = len(heuristic_seeds)
@@ -649,26 +775,65 @@ if __name__ == "__main__":
     initial_population = np.vstack([heuristic_seeds, scaled_random_init])
     
     print(f"\n初始种群大小: {TOTAL_POPSIZE} (包含{num_seeds}个启发式种子)")
-    print("开始三烟幕弹C库加速优化...")
+    
+    # 选择执行模式
+    USE_MULTIPROCESSING = True  # 设置为True启用多进程，False使用单进程
+    
+    if USE_MULTIPROCESSING:
+        print("🚀 启用多进程加速优化...")
+        import multiprocessing as mp
+        num_workers = mp.cpu_count()  # 限制最大进程数
+        print(f"  使用 {num_workers} 个工作进程")
+        
+        # 确保主进程C库已初始化
+        get_smoke_lib()
+        
+        objective_func = three_bombs_objective_function_mp
+        workers_setting = num_workers
+    else:
+        print("🔧 使用单进程优化...")
+        # 确保C库已初始化
+        get_smoke_lib()
+        
+        objective_func = three_bombs_objective_function
+        workers_setting = 1
     
     start_time = time.time()
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     
     # 差分进化优化
-    result = differential_evolution(
-        three_bombs_objective_function,
-        bounds,
-        init=initial_population,
-        strategy='rand1bin',
-        maxiter=10000,  # 适当的迭代次数
-        tol=0.001,
-        recombination=0.7,
-        mutation=(0.5, 1.0),
-        disp=True,
-        workers=-1,  # C库可能不是线程安全的
-        seed=42,
-        atol=1e-6
-    )
+    if USE_MULTIPROCESSING:
+        # 多进程版本：让每个工作进程自己初始化C库
+        result = differential_evolution(
+            objective_func,
+            bounds,
+            init=initial_population,
+            strategy='best1bin',
+            maxiter=2000,
+            tol=0.001,
+            recombination=0.7,
+            mutation=(0.5, 1.0),
+            disp=True,
+            workers=workers_setting,
+            seed=42,
+            atol=1e-6
+        )
+    else:
+        # 单进程版本
+        result = differential_evolution(
+            objective_func,
+            bounds,
+            init=initial_population,
+            strategy='rand1bin',
+            maxiter=1000,
+            tol=0.001,
+            recombination=0.7,
+            mutation=(0.5, 1.0),
+            disp=True,
+            workers=workers_setting,
+            seed=42,
+            atol=1e-6
+        )
     
     end_time = time.time()
     print(f"\n优化完成，总耗时: {end_time - start_time:.2f} 秒")
@@ -714,7 +879,7 @@ if __name__ == "__main__":
                 bomb_end = min(traj['t_explode'] + SMOKE_DURATION, MISSILE_FLIGHT_TIME)
                 
                 if bomb_start < bomb_end:
-                    single_duration = c_smoke_lib.calculate_multiple_clouds_duration(
+                    single_duration = get_smoke_lib().calculate_multiple_clouds_duration(
                         P_M1_0, VEC_V_M1, [traj['explode_pos']],
                         bomb_start, bomb_end,
                         OPTIMIZER_TIME_STEP, V_SMOKE_SINK_SPEED
@@ -723,11 +888,11 @@ if __name__ == "__main__":
                 else:
                     print(f"    第{i}枚单独遮蔽时长: 0.000000 秒 (无效)")
             
-            # 验证总时长计算
+            # 验证总时长计算 - 使用原始目标函数确保一致性
             print(f"\n🔍 总时长验证:")
             print(f"  全局有效时间段: {total_global_start:.3f}s - {total_global_end:.3f}s")
             
-            # 重新计算总时长用于验证
+            # 重新计算总时长用于验证（使用单进程版本确保一致性）
             verification_duration = -three_bombs_objective_function(best_params)
             print(f"  优化结果时长: {max_duration:.6f} 秒")
             print(f"  验证计算时长: {verification_duration:.6f} 秒")
