@@ -11,7 +11,10 @@
 #endif
 
 // 全局常量（与Python程序保持一致）
-static const int NUM_KEY_POINTS = 100;  // 50个底面点 + 50个顶面点
+static const int NUM_KEY_POINTS = 100;  // 改进的采样方式：30个底面 + 30个顶面 + 40个侧面
+static const int NUM_BOTTOM_POINTS = 30;   // 底面圆周点数
+static const int NUM_TOP_POINTS = 30;      // 顶面圆周点数
+static const int NUM_SIDE_POINTS = 40;     // 侧面点数
 static const double REAL_TARGET_CENTER[3] = {0.0, 200.0, 0.0};
 static const double REAL_TARGET_RADIUS = 7.0;
 static const double REAL_TARGET_HEIGHT = 10.0;
@@ -79,32 +82,56 @@ EXPORT double point_to_line_distance(const double point[3],
                dist_vec[2]*dist_vec[2]);
 }
 
-// 生成目标关键点
+// 生成目标关键点 - 改进的采样方式
 EXPORT void generate_target_key_points(double key_points[][3]) {
     int idx = 0;
-    const int num_points_per_circle = 50;
     
-    // 底面圆（z=0）
-    for (int i = 0; i < num_points_per_circle; i++) {
-        double angle = 2.0 * M_PI_LOCAL * i / num_points_per_circle;
+    // 1. 底面圆周采样（z=0）
+    for (int i = 0; i < NUM_BOTTOM_POINTS; i++) {
+        double angle = 2.0 * M_PI_LOCAL * i / NUM_BOTTOM_POINTS;
         key_points[idx][0] = REAL_TARGET_CENTER[0] + REAL_TARGET_RADIUS * cos(angle);
         key_points[idx][1] = REAL_TARGET_CENTER[1] + REAL_TARGET_RADIUS * sin(angle);
         key_points[idx][2] = 0.0;
         idx++;
     }
     
-    // 顶面圆（z=10）
-    for (int i = 0; i < num_points_per_circle; i++) {
-        double angle = 2.0 * M_PI_LOCAL * i / num_points_per_circle;
+    // 2. 顶面圆周采样（z=10）
+    for (int i = 0; i < NUM_TOP_POINTS; i++) {
+        double angle = 2.0 * M_PI_LOCAL * i / NUM_TOP_POINTS;
         key_points[idx][0] = REAL_TARGET_CENTER[0] + REAL_TARGET_RADIUS * cos(angle);
         key_points[idx][1] = REAL_TARGET_CENTER[1] + REAL_TARGET_RADIUS * sin(angle);
         key_points[idx][2] = REAL_TARGET_HEIGHT;
         idx++;
     }
+    
+    // 3. 圆柱侧面采样 - 在不同高度和角度均匀分布
+    int points_per_height = 8;  // 每个高度层8个点
+    int height_layers = NUM_SIDE_POINTS / points_per_height;  // 5个高度层
+    
+    for (int h = 0; h < height_layers; h++) {
+        double z = REAL_TARGET_HEIGHT * (h + 1) / (height_layers + 1);  // 均匀分布在高度上
+        for (int i = 0; i < points_per_height; i++) {
+            double angle = 2.0 * M_PI_LOCAL * i / points_per_height;
+            key_points[idx][0] = REAL_TARGET_CENTER[0] + REAL_TARGET_RADIUS * cos(angle);
+            key_points[idx][1] = REAL_TARGET_CENTER[1] + REAL_TARGET_RADIUS * sin(angle);
+            key_points[idx][2] = z;
+            idx++;
+        }
+    }
 }
 
-// 主要的遮蔽检测函数
-EXPORT bool check_complete_blocking(const double missile_pos[3], const double cloud_pos[3]) {
+// 检查单个烟雾云是否遮蔽某个关键点
+bool is_point_blocked_by_cloud(const double key_point[3], 
+                              const double missile_pos[3], 
+                              const double cloud_pos[3]) {
+    double dist = point_to_line_distance(cloud_pos, missile_pos, key_point);
+    return dist <= R_SMOKE;
+}
+
+// 检查多个烟雾弹是否完全遮蔽目标（新增功能）
+EXPORT bool check_multiple_clouds_blocking(const double missile_pos[3], 
+                                         const double cloud_positions[][3], 
+                                         int num_clouds) {
     static double key_points[100][3];
     static bool initialized = false;
     
@@ -114,25 +141,46 @@ EXPORT bool check_complete_blocking(const double missile_pos[3], const double cl
         initialized = true;
     }
     
-    // 检查所有关键点是否都被遮蔽
+    // 检查每个关键点是否至少被一个烟雾弹遮蔽
     for (int i = 0; i < NUM_KEY_POINTS; i++) {
-        double dist = point_to_line_distance(cloud_pos, missile_pos, key_points[i]);
-        if (dist > R_SMOKE) {
-            return false;  // 有点未被遮蔽
+        bool point_blocked = false;
+        
+        // 检查是否被任意一个烟雾弹遮蔽
+        for (int j = 0; j < num_clouds; j++) {
+            if (is_point_blocked_by_cloud(key_points[i], missile_pos, cloud_positions[j])) {
+                point_blocked = true;
+                break;  // 只要有一个烟雾弹遮蔽该点就足够了
+            }
+        }
+        
+        if (!point_blocked) {
+            return false;  // 有关键点未被任何烟雾弹遮蔽
         }
     }
     
-    return true;  // 所有点都被遮蔽
+    return true;  // 所有关键点都被至少一个烟雾弹遮蔽
 }
 
-// 批量计算遮蔽时长的高效函数
-EXPORT double calculate_blocking_duration_batch(const double missile_start[3],
-                                              const double missile_velocity[3],
-                                              const double explode_pos[3],
-                                              double t_start,
-                                              double t_end,
-                                              double time_step,
-                                              double sink_speed) {
+// 主要的遮蔽检测函数（保持向后兼容）
+EXPORT bool check_complete_blocking(const double missile_pos[3], const double cloud_pos[3]) {
+    // 使用新的多烟雾弹函数，传入单个烟雾弹
+    double single_cloud[1][3];
+    single_cloud[0][0] = cloud_pos[0];
+    single_cloud[0][1] = cloud_pos[1];
+    single_cloud[0][2] = cloud_pos[2];
+    
+    return check_multiple_clouds_blocking(missile_pos, single_cloud, 1);
+}
+
+// 批量计算多烟雾弹遮蔽时长的高效函数（新增功能）
+EXPORT double calculate_multiple_clouds_blocking_duration(const double missile_start[3],
+                                                        const double missile_velocity[3],
+                                                        const double explode_positions[][3],
+                                                        int num_clouds,
+                                                        double t_start,
+                                                        double t_end,
+                                                        double time_step,
+                                                        double sink_speed) {
     double total_blocked_time = 0.0;
     int num_steps = (int)((t_end - t_start) / time_step) + 1;
     
@@ -147,21 +195,29 @@ EXPORT double calculate_blocking_duration_batch(const double missile_start[3],
             missile_start[2] + t * missile_velocity[2]
         };
         
-        // 当前烟雾云位置（考虑下沉）
+        // 当前所有烟雾云位置（考虑下沉）
         double time_since_explode = t - t_start;
-        double current_cloud_pos[3] = {
-            explode_pos[0],
-            explode_pos[1],
-            explode_pos[2] - sink_speed * time_since_explode
-        };
+        double current_cloud_positions[num_clouds][3];
+        bool any_cloud_active = false;
         
-        // 如果云团落地，停止计算
-        if (current_cloud_pos[2] <= 0.0) {
+        for (int j = 0; j < num_clouds; j++) {
+            current_cloud_positions[j][0] = explode_positions[j][0];
+            current_cloud_positions[j][1] = explode_positions[j][1];
+            current_cloud_positions[j][2] = explode_positions[j][2] - sink_speed * time_since_explode;
+            
+            // 检查是否有烟雾云还在空中
+            if (current_cloud_positions[j][2] > 0.0) {
+                any_cloud_active = true;
+            }
+        }
+        
+        // 如果所有云团都落地，停止计算
+        if (!any_cloud_active) {
             break;
         }
         
         // 检查是否完全遮蔽
-        if (check_complete_blocking(current_missile_pos, current_cloud_pos)) {
+        if (check_multiple_clouds_blocking(current_missile_pos, current_cloud_positions, num_clouds)) {
             total_blocked_time += time_step;
         }
     }
@@ -169,9 +225,28 @@ EXPORT double calculate_blocking_duration_batch(const double missile_start[3],
     return total_blocked_time;
 }
 
+// 批量计算遮蔽时长的高效函数（保持向后兼容）
+EXPORT double calculate_blocking_duration_batch(const double missile_start[3],
+                                              const double missile_velocity[3],
+                                              const double explode_pos[3],
+                                              double t_start,
+                                              double t_end,
+                                              double time_step,
+                                              double sink_speed) {
+    // 使用新的多烟雾弹函数，传入单个烟雾弹
+    double single_explode_pos[1][3];
+    single_explode_pos[0][0] = explode_pos[0];
+    single_explode_pos[0][1] = explode_pos[1];
+    single_explode_pos[0][2] = explode_pos[2];
+    
+    return calculate_multiple_clouds_blocking_duration(missile_start, missile_velocity, 
+                                                     single_explode_pos, 1, 
+                                                     t_start, t_end, time_step, sink_speed);
+}
+
 // 获取版本信息
 EXPORT const char* get_version() {
-    return "1.0.3";
+    return "1.1.0";  // 更新版本号，表示增加了多烟雾弹功能
 }
 
 // 获取关键点数量 - 添加缺失的函数
@@ -222,9 +297,33 @@ EXPORT int simple_test() {
 EXPORT void debug_info() {
     printf("C库调试信息:\n");
     printf("  目标关键点数量: %d\n", NUM_KEY_POINTS);
+    printf("    - 底面圆周点: %d\n", NUM_BOTTOM_POINTS);
+    printf("    - 顶面圆周点: %d\n", NUM_TOP_POINTS);
+    printf("    - 侧面分层点: %d\n", NUM_SIDE_POINTS);
     printf("  烟雾有效半径: %.1f m\n", R_SMOKE);
     printf("  真目标中心: (%.1f, %.1f, %.1f)\n", 
            REAL_TARGET_CENTER[0], REAL_TARGET_CENTER[1], REAL_TARGET_CENTER[2]);
     printf("  真目标半径: %.1f m\n", REAL_TARGET_RADIUS);
     printf("  真目标高度: %.1f m\n", REAL_TARGET_HEIGHT);
+}
+
+// 多烟雾弹测试函数
+EXPORT int test_multiple_clouds() {
+    // 测试场景：2个烟雾弹
+    double missile[3] = {0.0, 0.0, 1000.0};
+    double clouds[2][3] = {
+        {0.0, 190.0, 500.0},  // 第一个烟雾弹
+        {0.0, 210.0, 500.0}   // 第二个烟雾弹
+    };
+    
+    bool result = check_multiple_clouds_blocking(missile, clouds, 2);
+    return result ? 1 : 0;
+}
+
+// 获取采样点详细信息
+EXPORT void get_sampling_info(int* total_points, int* bottom_points, int* top_points, int* side_points) {
+    *total_points = NUM_KEY_POINTS;
+    *bottom_points = NUM_BOTTOM_POINTS;
+    *top_points = NUM_TOP_POINTS;
+    *side_points = NUM_SIDE_POINTS;
 }
