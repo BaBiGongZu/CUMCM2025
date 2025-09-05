@@ -76,25 +76,15 @@ def build_library(platform_target=None):
         # Windows - 使用MinGW或MSVC
         output_file = f"{lib_dir}/smoke_blocking_windows.dll"
         # 优先尝试clang-cl (LLVM)
-        try:
-            cmd = [
-                'clang-cl',
-                '/O2',
-                '/LD',
-                source_file,
-                f'/Fe:{output_file}',
-                '/link', '/DEFAULTLIB:msvcrt.lib'
-            ]
-        except FileNotFoundError:
-            # 备选：MinGW
-            cmd = [
-                'gcc',
-                '-shared',
-                '-O3',
-                '-o', output_file,
-                source_file,
-                '-lm'
-            ]
+
+        cmd = [
+            'gcc',
+            '-shared',
+            '-O3',
+            '-o', output_file,
+            source_file,
+            '-lm'
+        ]
     
     try:
         print(f"执行命令: {' '.join(cmd)}")
