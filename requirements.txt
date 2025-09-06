@@ -11,3 +11,4 @@ openpyxl
 xlrd
 black
 ruff
+pyswarms
