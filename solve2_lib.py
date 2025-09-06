@@ -59,33 +59,29 @@ class SmokeBlockingCLib:
     
     def _setup_function_interfaces(self):
         """设置C函数接口"""
-        # check_complete_blocking - 核心函数
-        self.c_lib.check_complete_blocking.argtypes = [
-            ctypes.POINTER(ctypes.c_double),  # missile_pos
-            ctypes.POINTER(ctypes.c_double)   # cloud_pos
-        ]
-        self.c_lib.check_complete_blocking.restype = ctypes.c_bool
-        
-        # calculate_blocking_duration_batch - 批量计算
-        self.c_lib.calculate_blocking_duration_batch.argtypes = [
-            ctypes.POINTER(ctypes.c_double),  # missile_start
-            ctypes.POINTER(ctypes.c_double),  # missile_velocity
-            ctypes.POINTER(ctypes.c_double),  # explode_pos
-            ctypes.c_double,                  # t_start
-            ctypes.c_double,                  # t_end
+        # 新的核心函数 - calculate_total_blocking_duration
+        self.c_lib.calculate_total_blocking_duration.argtypes = [
+            ctypes.POINTER(ctypes.c_double),  # missile_start_arr
+            ctypes.POINTER(ctypes.c_double),  # missile_velocity_arr
+            ctypes.POINTER(ctypes.c_double),  # explode_positions_flat
+            ctypes.POINTER(ctypes.c_double),  # explode_times_arr
+            ctypes.c_int,                     # num_clouds
+            ctypes.c_double,                  # total_flight_time
             ctypes.c_double,                  # time_step
-            ctypes.c_double                   # sink_speed
+            ctypes.c_double,                  # sink_speed
+            ctypes.c_double                   # smoke_duration
         ]
-        self.c_lib.calculate_blocking_duration_batch.restype = ctypes.c_double
-        
+        self.c_lib.calculate_total_blocking_duration.restype = ctypes.c_double
+
         # 其他辅助函数
         self.c_lib.get_version.restype = ctypes.c_char_p
         self.c_lib.get_key_points_count.restype = ctypes.c_int
         
-        self.c_lib.get_first_key_point.argtypes = [
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double)
+        self.c_lib.get_sampling_info.argtypes = [
+            ctypes.POINTER(ctypes.c_int),     # total
+            ctypes.POINTER(ctypes.c_int),     # bottom
+            ctypes.POINTER(ctypes.c_int),     # top
+            ctypes.POINTER(ctypes.c_int)      # side
         ]
     
     def _verify_library(self):
@@ -93,20 +89,22 @@ class SmokeBlockingCLib:
         version = self.get_version()
         key_points_count = self.get_key_points_count()
         
-        x = ctypes.c_double()
-        y = ctypes.c_double()
-        z = ctypes.c_double()
-        self.c_lib.get_first_key_point(
-            ctypes.byref(x), ctypes.byref(y), ctypes.byref(z)
+        total = ctypes.c_int()
+        bottom = ctypes.c_int()
+        top = ctypes.c_int()
+        side = ctypes.c_int()
+        self.c_lib.get_sampling_info(
+            ctypes.byref(total), ctypes.byref(bottom),
+            ctypes.byref(top), ctypes.byref(side)
         )
         
         print(f"C库版本: {version}")
         print(f"关键点数量: {key_points_count}")
-        print(f"第一个关键点: ({x.value:.2f}, {y.value:.2f}, {z.value:.2f})")
-        
-        if key_points_count != 100:
-            raise RuntimeError(f"关键点数量不正确: {key_points_count}, 期望: 100")
-    
+        print(f"采样分布: 底面{bottom.value} + 顶面{top.value} + 侧面{side.value} = {total.value}")
+
+        if key_points_count != total.value:
+            raise RuntimeError(f"关键点数量不一致: {key_points_count} vs {total.value}")
+
     def get_version(self):
         """获取库版本"""
         return self.c_lib.get_version().decode('utf-8')
@@ -115,41 +113,63 @@ class SmokeBlockingCLib:
         """获取关键点数量"""
         return self.c_lib.get_key_points_count()
     
-    def check_complete_blocking(self, missile_pos, cloud_pos):
+    def calculate_total_duration(self, missile_start, missile_velocity,
+                                explode_positions, explode_times, total_flight_time,
+                                time_step, sink_speed, smoke_duration):
         """
-        检查烟雾是否完全遮蔽目标
-        
+        计算总遮蔽时长（适配新的C库接口）
+
         Parameters:
         -----------
-        missile_pos : array-like
-            导弹当前位置 [x, y, z]
-        cloud_pos : array-like
-            烟雾云当前位置 [x, y, z]
-            
+        missile_start : array-like
+            导弹起始位置 [x, y, z]
+        missile_velocity : array-like
+            导弹速度向量 [vx, vy, vz]
+        explode_positions : list of array-like
+            烟雾弹起爆位置列表 [[x1,y1,z1], [x2,y2,z2], ...]
+        explode_times : array-like
+            起爆时间列表 [t1, t2, ...]
+        total_flight_time : float
+            导弹总飞行时间
+        time_step : float
+            时间步长
+        sink_speed : float
+            烟雾下沉速度
+        smoke_duration : float
+            烟雾持续时间
+
         Returns:
         --------
-        bool : 是否完全遮蔽
+        float : 总遮蔽时长
         """
-        missile_pos_c = (ctypes.c_double * 3)(*missile_pos)
-        cloud_pos_c = (ctypes.c_double * 3)(*cloud_pos)
-        
-        return self.c_lib.check_complete_blocking(missile_pos_c, cloud_pos_c)
-    
-    def calculate_blocking_duration_batch(self, missile_start, missile_velocity, explode_pos,
-                                        t_start, t_end, time_step, sink_speed):
-        """批量计算遮蔽时长"""
-        missile_start_c = (ctypes.c_double * 3)(*missile_start)
-        missile_velocity_c = (ctypes.c_double * 3)(*missile_velocity)
-        explode_pos_c = (ctypes.c_double * 3)(*explode_pos)
-        
-        return self.c_lib.calculate_blocking_duration_batch(
+        # 转换为numpy数组并确保数据类型
+        missile_start = np.array(missile_start, dtype=np.float64)
+        missile_velocity = np.array(missile_velocity, dtype=np.float64)
+        explode_positions = np.array(explode_positions, dtype=np.float64)
+        explode_times = np.array(explode_times, dtype=np.float64)
+
+        num_clouds = len(explode_positions)
+
+        # 准备C函数参数
+        missile_start_c = missile_start.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        missile_velocity_c = missile_velocity.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+
+        # 展平起爆位置数组
+        explode_pos_flat = explode_positions.flatten()
+        explode_pos_c = explode_pos_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        explode_times_c = explode_times.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+
+        # 调用C函数
+        return self.c_lib.calculate_total_blocking_duration(
             missile_start_c,
             missile_velocity_c,
             explode_pos_c,
-            ctypes.c_double(t_start),
-            ctypes.c_double(t_end),
-            ctypes.c_double(time_step),
-            ctypes.c_double(sink_speed)
+            explode_times_c,
+            num_clouds,
+            total_flight_time,
+            time_step,
+            sink_speed,
+            smoke_duration
         )
 
 # --- 全局常量（与solve1.py保持一致）---
@@ -232,17 +252,15 @@ def c_accelerated_objective_function(params):
     if explode_pos[2] <= REAL_TARGET_HEIGHT:
         return 0.0
     
-    # 4. 使用C库进行快速遮蔽计算
-    t_start = t_explode_abs
-    t_end = min(t_explode_abs + SMOKE_DURATION, MISSILE_FLIGHT_TIME)
-    
-    if t_start >= t_end:
-        return 0.0
-    
-    # 调用C库的批量计算函数
-    total_duration = c_smoke_lib.calculate_blocking_duration_batch(
-        P_M1_0, VEC_V_M1, explode_pos,
-        t_start, t_end, OPTIMIZER_TIME_STEP, V_SMOKE_SINK_SPEED
+    # 4. 使用新的C库接口进行计算
+    explode_positions = [explode_pos]  # 单个烟雾弹
+    explode_times = [t_explode_abs]
+
+    # 调用新的C库函数
+    total_duration = c_smoke_lib.calculate_total_duration(
+        P_M1_0, VEC_V_M1, explode_positions, explode_times,
+        MISSILE_FLIGHT_TIME, OPTIMIZER_TIME_STEP,
+        V_SMOKE_SINK_SPEED, SMOKE_DURATION
     )
     
     return -total_duration  # 负值用于最大化
@@ -268,36 +286,16 @@ def python_objective_function_for_comparison(params):
     if explode_pos[2] <= REAL_TARGET_HEIGHT:
         return 0.0
     
-    # Python版本的遮蔽计算
-    t_start = t_explode_abs
-    t_end = min(t_explode_abs + SMOKE_DURATION, MISSILE_FLIGHT_TIME)
-    
-    if t_start >= t_end:
-        return 0.0
-    
-    # 使用较大的时间步长以避免计算时间过长
-    time_step = 0.01
-    num_steps_actual = int((t_end - t_start) / time_step) + 1
-    if num_steps_actual <= 0:
-        return 0.0
-    
-    t_array = np.linspace(t_start, t_end, num_steps_actual)
-    valid_duration_steps = 0
-    
-    for t in t_array:
-        current_missile_pos = P_M1_0 + t * VEC_V_M1
-        time_since_explode = t - t_explode_abs
-        current_cloud_pos = explode_pos.copy()
-        current_cloud_pos[2] -= V_SMOKE_SINK_SPEED * time_since_explode
-        
-        if current_cloud_pos[2] <= 0:
-            break
-        
-        # 使用C库的单次检查函数
-        if c_smoke_lib.check_complete_blocking(current_missile_pos, current_cloud_pos):
-            valid_duration_steps += 1
-    
-    total_duration = valid_duration_steps * time_step
+    # 使用C库函数进行计算，而不是纯Python实现
+    explode_positions = [explode_pos]
+    explode_times = [t_explode_abs]
+
+    total_duration = c_smoke_lib.calculate_total_duration(
+        P_M1_0, VEC_V_M1, explode_positions, explode_times,
+        MISSILE_FLIGHT_TIME, 0.01,  # 使用较大的时间步长以提高性能
+        V_SMOKE_SINK_SPEED, SMOKE_DURATION
+    )
+
     return -total_duration
 
 def print_solution_details(params, duration):
@@ -378,7 +376,7 @@ if __name__ == "__main__":
         # 135.0596, 0.110243, 0.1983, 0.6139
         134.302340292277, 0.088445143950, 0.767470916269, 0.196204160294
     ]])
-    
+
     # 生成初始种群
     TOTAL_POPSIZE = 1000  # 由于C加速，可以使用更大的种群
     num_random_individuals = TOTAL_POPSIZE - 1
