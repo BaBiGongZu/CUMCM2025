@@ -1,3 +1,4 @@
+mealpy
 gurobipy
 numpy
 pandas
